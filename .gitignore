@@ -1,0 +1,6 @@
+/target
+/watcher/target
+/daemon/target
+*.wasm
+*.o
+*.d

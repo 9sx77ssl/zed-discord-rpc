@@ -1,0 +1,14 @@
+[Unit]
+Description=Zed Discord RPC
+After=network.target
+After=discord.target
+
+[Service]
+Type=simple
+ExecStartPre=/bin/bash -c 'sleep 3'
+ExecStart=%h/.local/bin/zed-discord-rpc-daemon
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
