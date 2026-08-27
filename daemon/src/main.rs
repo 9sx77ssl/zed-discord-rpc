@@ -4,7 +4,6 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Seek};
 use std::path::PathBuf;
-use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -14,6 +13,13 @@ struct WorkspaceInfo {
     workspace_path: String,
     language: String,
     git_branch: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct TrackedWorkspace {
+    info: WorkspaceInfo,
+    last_seen: u64,
+    closed: bool,
 }
 
 const DISCORD_APP_ID: &str = "1390711660016308254";
@@ -93,86 +99,84 @@ const SKIP_PATHS: &[&str] = &[
     "/home/rsz/.cache", "/tmp", "/snap",
 ];
 
-fn parse_log_workspaces(log: &str) -> Vec<String> {
-    let mut workspaces = Vec::new();
+fn extract_timestamp(line: &str) -> u64 {
+    if !line.starts_with("20") { return 0; }
+    let parts: Vec<&str> = line.split(&['-', 'T', ':', '+'][..]).collect();
+    if parts.len() < 6 { return 0; }
+    let year: u64 = parts[0].parse().unwrap_or(0);
+    let month: u64 = parts[1].parse().unwrap_or(0);
+    let day: u64 = parts[2].parse().unwrap_or(0);
+    let hour: u64 = parts[3].parse().unwrap_or(0);
+    let min: u64 = parts[4].parse().unwrap_or(0);
+    let sec: u64 = parts[5].split('.').next().unwrap_or("0").parse().unwrap_or(0);
+    if year == 0 || month == 0 || day == 0 { return 0; }
+    let days = (year - 1970) * 365 + (year - 1970) / 4 + (month - 1) * 30 + day - 1;
+    days * 86400 + hour * 3600 + min * 60 + sec
+}
+
+fn parse_log_chunk(log: &str) -> (Vec<String>, Vec<String>) {
+    let mut found_ws = Vec::new();
+    let mut closed_ws = Vec::new();
+
     for line in log.lines() {
+        let ts = extract_timestamp(line);
+        if ts == 0 { continue; }
+
         if let Some(s) = line.find("working directory: \"") {
             let st = s + 21;
             if let Some(e) = line[st..].find('"') {
                 let p = line[st..st+e].to_string();
                 if !p.is_empty() && p != "/" && !SKIP_PATHS.iter().any(|x| p.starts_with(x)) {
-                    if std::path::Path::new(&p).exists() && !workspaces.contains(&p) {
-                        workspaces.push(p);
+                    if std::path::Path::new(&p).exists() && !found_ws.contains(&p) {
+                        found_ws.push(p);
                     }
                 }
             }
         }
+
         if let Some(s) = line.find("opening git repository at \"") {
             let st = s + 28;
             if let Some(e) = line[st..].find('"') {
                 let mut p = line[st..st+e].to_string();
-                if let Some(end) = p.rfind("/.git") {
-                    p.truncate(end);
-                }
+                if let Some(end) = p.rfind("/.git") { p.truncate(end); }
                 if !p.is_empty() && !SKIP_PATHS.iter().any(|x| p.starts_with(x)) {
-                    if std::path::Path::new(&p).exists() && !workspaces.contains(&p) {
-                        workspaces.push(p);
+                    if std::path::Path::new(&p).exists() && !found_ws.contains(&p) {
+                        found_ws.push(p);
+                    }
+                }
+            }
+        }
+
+        if line.contains("stopping language server") {
+            for known in &found_ws {
+                if line.contains(known) || line.lines().any(|l| l.contains(&**known)) {
+                    if !closed_ws.contains(known) {
+                        closed_ws.push(known.clone());
+                    }
+                }
+            }
+        }
+
+        if line.contains("worktree diagnostics") {
+            if let Some(sp) = line.find("largest ") {
+                let st = sp + 8;
+                if let Some(e) = line[st..].find(" (") {
+                    let p = line[st..st+e].to_string();
+                    if !p.is_empty() && p != "none" && !SKIP_PATHS.iter().any(|x| p.starts_with(x)) {
+                        if std::path::Path::new(&p).exists() && !found_ws.contains(&p) {
+                            found_ws.push(p);
+                        }
                     }
                 }
             }
         }
     }
-    workspaces
+
+    (found_ws, closed_ws)
 }
 
-fn get_active_window_caption() -> Option<String> {
-    let output = Command::new("qdbus6")
-        .args(["org.kde.KWin", "/KWin", "org.kde.KWin.queryWindowInfo"])
-        .output()
-        .ok()?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut caption = None;
-    let mut resource_class = None;
-
-    for line in stdout.lines() {
-        if let Some(val) = line.strip_prefix("caption: ") {
-            caption = Some(val.trim().to_string());
-        }
-        if let Some(val) = line.strip_prefix("resourceClass: ") {
-            resource_class = Some(val.trim().to_string());
-        }
-    }
-
-    if resource_class.as_deref() == Some("dev.zed.Zed") {
-        caption
-    } else {
-        None
-    }
-}
-
-fn extract_project_name_from_caption(caption: &str) -> Option<String> {
-    if let Some(pos) = caption.find(" — ") {
-        Some(caption[..pos].trim().to_string())
-    } else if let Some(pos) = caption.find(" - ") {
-        Some(caption[..pos].trim().to_string())
-    } else {
-        Some(caption.trim().to_string())
-    }
-}
-
-fn find_workspace_by_name(name: &str, workspaces: &HashMap<String, WorkspaceInfo>) -> Option<String> {
-    for (path, info) in workspaces {
-        if info.workspace_name == name {
-            return Some(path.clone());
-        }
-    }
-    for (path, _info) in workspaces {
-        if path.ends_with(&format!("/{}", name)) {
-            return Some(path.clone());
-        }
-    }
-    None
+fn now() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as u64
 }
 
 fn ensure_workspace_info(path: &str, workspaces: &mut HashMap<String, WorkspaceInfo>) -> WorkspaceInfo {
@@ -191,10 +195,6 @@ fn ensure_workspace_info(path: &str, workspaces: &mut HashMap<String, WorkspaceI
     info
 }
 
-fn now() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64
-}
-
 fn send_activity(client: &mut DiscordIpcClient, info: &WorkspaceInfo, t0: &Instant) {
     let branch = info.git_branch.as_deref().unwrap_or("");
     let lang = if info.language == "Unknown" { "" } else { &info.language };
@@ -209,7 +209,7 @@ fn send_activity(client: &mut DiscordIpcClient, info: &WorkspaceInfo, t0: &Insta
     let large = info.workspace_name.clone();
     let small = if !lang.is_empty() { lang.to_string() } else { "Zed".into() };
 
-    let ts = now() - t0.elapsed().as_secs() as i64;
+    let ts = now() as i64 - t0.elapsed().as_secs() as i64;
 
     let activity = activity::Activity::new()
         .state(&state)
@@ -239,14 +239,15 @@ fn main() {
     let mut last_content = String::new();
     let t0 = Instant::now();
     let mut was_running = false;
-    let mut workspaces: HashMap<String, WorkspaceInfo> = HashMap::new();
-    let mut active_ws_path: Option<String> = None;
+    let mut known_workspaces: HashMap<String, WorkspaceInfo> = HashMap::new();
+    let mut tracked: Vec<TrackedWorkspace> = Vec::new();
+    let mut active_idx: Option<usize> = None;
     let mut last_sent_path: Option<String> = None;
-    let mut qdbus_tick = 0u32;
+    let mut tick = 0u32;
 
     if let Ok(content) = fs::read_to_string(&all_workspaces_file()) {
         if let Ok(loaded) = serde_json::from_str::<HashMap<String, WorkspaceInfo>>(&content) {
-            workspaces = loaded;
+            known_workspaces = loaded;
         }
     }
 
@@ -257,21 +258,28 @@ fn main() {
             if !was_running {
                 println!("Zed started");
                 last_log_sz = 0;
-                active_ws_path = None;
+                active_idx = None;
                 last_sent_path = None;
+                tracked.clear();
                 if let Some(ref mut f) = log_file { let _ = f.seek(std::io::SeekFrom::Start(0)); }
             }
 
             if let Ok(content) = fs::read_to_string(&sf) {
                 if content != last_content {
                     if let Ok(info) = serde_json::from_str::<WorkspaceInfo>(&content) {
-                        workspaces.insert(info.workspace_path.clone(), info.clone());
+                        known_workspaces.insert(info.workspace_path.clone(), info.clone());
                         last_content = content;
-                        let ws_path = info.workspace_path.clone();
-                        active_ws_path = Some(ws_path.clone());
-                        if last_sent_path.as_ref() != Some(&ws_path) {
+                        let ts = now();
+                        if let Some(t) = tracked.iter_mut().find(|t| t.info.workspace_path == info.workspace_path) {
+                            t.last_seen = ts;
+                            t.closed = false;
+                        } else {
+                            tracked.push(TrackedWorkspace { info: info.clone(), last_seen: ts, closed: false });
+                        }
+                        active_idx = Some(tracked.len() - 1);
+                        if last_sent_path.as_ref() != Some(&info.workspace_path) {
                             send_activity(&mut client, &info, &t0);
-                            last_sent_path = Some(ws_path);
+                            last_sent_path = Some(info.workspace_path);
                         }
                     }
                 }
@@ -283,9 +291,41 @@ fn main() {
                     if sz > last_log_sz {
                         let mut buf = String::new();
                         if file.read_to_string(&mut buf).is_ok() {
-                            let ws_list = parse_log_workspaces(&buf);
-                            for ws in ws_list {
-                                ensure_workspace_info(&ws, &mut workspaces);
+                            let (found, closed) = parse_log_chunk(&buf);
+                            let ts = now();
+
+                            for ws_path in &found {
+                                let info = ensure_workspace_info(ws_path, &mut known_workspaces);
+                                if let Some(t) = tracked.iter_mut().find(|t| t.info.workspace_path == *ws_path) {
+                                    t.last_seen = ts;
+                                    t.closed = false;
+                                } else {
+                                    tracked.push(TrackedWorkspace { info, last_seen: ts, closed: false });
+                                }
+                            }
+
+                            for ws_path in &closed {
+                                if let Some(t) = tracked.iter_mut().find(|t| t.info.workspace_path == *ws_path) {
+                                    t.closed = true;
+                                    println!("Workspace closed: {}", ws_path);
+                                }
+                            }
+
+                            let most_recent = tracked.iter()
+                                .enumerate()
+                                .filter(|(_, t)| !t.closed)
+                                .max_by_key(|(_, t)| t.last_seen)
+                                .map(|(i, _)| i);
+
+                            if let Some(idx) = most_recent {
+                                if active_idx != Some(idx) {
+                                    active_idx = Some(idx);
+                                    let info = &tracked[idx].info;
+                                    if last_sent_path.as_ref() != Some(&info.workspace_path) {
+                                        send_activity(&mut client, info, &t0);
+                                        last_sent_path = Some(info.workspace_path.clone());
+                                    }
+                                }
                             }
                         }
                         last_log_sz = sz;
@@ -296,20 +336,16 @@ fn main() {
                 last_log_sz = log_file.as_ref().and_then(|f| f.metadata().ok()).map(|m| m.len()).unwrap_or(0);
             }
 
-            qdbus_tick += 1;
-            if qdbus_tick >= 3 {
-                qdbus_tick = 0;
-                if let Some(caption) = get_active_window_caption() {
-                    if let Some(project_name) = extract_project_name_from_caption(&caption) {
-                        if let Some(ws_path) = find_workspace_by_name(&project_name, &workspaces) {
-                            if active_ws_path.as_ref() != Some(&ws_path) {
-                                active_ws_path = Some(ws_path.clone());
-                                let info = ensure_workspace_info(&ws_path, &mut workspaces);
-                                if last_sent_path.as_ref() != Some(&ws_path) {
-                                    send_activity(&mut client, &info, &t0);
-                                    last_sent_path = Some(ws_path);
-                                }
-                            }
+            tick += 1;
+            if tick >= 10 {
+                tick = 0;
+                tracked.retain(|t| t.info.workspace_path != "/".to_string());
+                if active_idx.map_or(false, |i| i < tracked.len()) {
+                    let ws_path = tracked[active_idx.unwrap()].info.workspace_path.clone();
+                    if let Some(info) = known_workspaces.get(&ws_path) {
+                        if last_sent_path.as_ref() != Some(&ws_path) {
+                            send_activity(&mut client, info, &t0);
+                            last_sent_path = Some(ws_path);
                         }
                     }
                 }
@@ -319,13 +355,14 @@ fn main() {
         } else if was_running {
             println!("Zed closed");
             let _ = client.clear_activity();
-            active_ws_path = None;
+            active_idx = None;
             last_sent_path = None;
+            tracked.clear();
             was_running = false;
             log_file = fs::File::open(&log_path).ok();
             last_log_sz = log_file.as_ref().and_then(|f| f.metadata().ok()).map(|m| m.len()).unwrap_or(0);
         }
 
-        thread::sleep(Duration::from_millis(500));
+        thread::sleep(Duration::from_millis(400));
     }
 }
