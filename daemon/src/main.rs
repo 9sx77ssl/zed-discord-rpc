@@ -1,5 +1,6 @@
 use discord_rich_presence::{activity, DiscordIpc, DiscordIpcClient};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Seek};
 use std::path::PathBuf;
@@ -12,7 +13,6 @@ struct WorkspaceInfo {
     workspace_path: String,
     language: String,
     git_branch: Option<String>,
-    file_name: Option<String>,
 }
 
 const DISCORD_APP_ID: &str = "1390711660016308254";
@@ -59,21 +59,76 @@ fn detect_branch(p: &std::path::Path) -> Option<String> {
     Some(h.strip_prefix("ref: refs/heads/").unwrap_or(h.get(..7).unwrap_or(h)).into())
 }
 
-fn parse_workspace(log: &str) -> Option<String> {
+fn lang_from_ext(ext: &str) -> &str {
+    match ext {
+        "rs" => "Rust",
+        "ts" | "tsx" => "TypeScript",
+        "js" | "jsx" => "JavaScript",
+        "py" => "Python",
+        "go" => "Go",
+        "java" => "Java",
+        "c" | "h" => "C",
+        "cpp" | "cxx" | "cc" | "hpp" => "C++",
+        "rb" => "Ruby",
+        "php" => "PHP",
+        "swift" => "Swift",
+        "kt" | "kts" => "Kotlin",
+        "dart" => "Dart",
+        "ex" | "exs" => "Elixir",
+        "lua" => "Lua",
+        "sh" | "bash" => "Shell",
+        "yaml" | "yml" => "YAML",
+        "json" => "JSON",
+        "toml" => "TOML",
+        "md" => "Markdown",
+        "html" => "HTML",
+        "css" => "CSS",
+        "sql" => "SQL",
+        "zig" => "Zig",
+        "nim" => "Nim",
+        "v" => "V",
+        "hs" => "Haskell",
+        "ml" | "mli" => "OCaml",
+        "erl" => "Erlang",
+        _ => "",
+    }
+}
+
+fn parse_log(log: &str) -> (Option<String>, Option<String>) {
     let skip = ["/usr/bin", "/usr/lib", "/usr/share", "/home/rsz/.local", "/home/rsz/.cache", "/tmp", "/snap"];
+    let mut workspace: Option<String> = None;
+    let mut file_path: Option<String> = None;
+
     for line in log.lines().rev() {
-        if let Some(s) = line.find("working directory: \"") {
-            let st = s + 21;
-            if let Some(e) = line[st..].find('"') {
-                let mut p = line[st..st+e].to_string();
-                if !p.starts_with('/') { p.insert(0, '/'); }
-                if !p.is_empty() && p != "/" && !skip.iter().any(|x| p.starts_with(x)) {
-                    return Some(p);
+        if workspace.is_none() {
+            if let Some(s) = line.find("working directory: \"") {
+                let st = s + 21;
+                if let Some(e) = line[st..].find('"') {
+                    let mut p = line[st..st+e].to_string();
+                    if !p.starts_with('/') { p.insert(0, '/'); }
+                    if !p.is_empty() && p != "/" && !skip.iter().any(|x| p.starts_with(x)) {
+                        workspace = Some(p);
+                    }
                 }
             }
         }
+
+        if file_path.is_none() {
+            if let Some(s) = line.find("\"uri\": \"file://") {
+                let st = s + 15;
+                if let Some(e) = line[st..].find('"') {
+                    let p = line[st..st+e].to_string();
+                    if !p.is_empty() && !p.starts_with("/usr") && !p.starts_with("/home/rsz/.local") {
+                        file_path = Some(p);
+                    }
+                }
+            }
+        }
+
+        if workspace.is_some() && file_path.is_some() { break; }
     }
-    None
+
+    (workspace, file_path)
 }
 
 fn now() -> i64 {
@@ -97,6 +152,7 @@ fn main() {
     let mut last_content = String::new();
     let t0 = Instant::now();
     let mut was_running = false;
+    let mut workspaces: HashMap<String, WorkspaceInfo> = HashMap::new();
 
     loop {
         let running = zed_running();
@@ -106,13 +162,14 @@ fn main() {
                 println!("Zed started");
                 last_log_sz = 0;
                 last_ws = None;
+                workspaces.clear();
                 if let Some(ref mut f) = log_file { let _ = f.seek(std::io::SeekFrom::Start(0)); }
             }
 
             if let Ok(content) = fs::read_to_string(&sf) {
                 if content != last_content {
                     if let Ok(info) = serde_json::from_str::<WorkspaceInfo>(&content) {
-                        send_activity(&mut client, &info, &t0);
+                        workspaces.insert(info.workspace_path.clone(), info.clone());
                         last_content = content;
                         last_ws = Some(info.workspace_path);
                     }
@@ -125,20 +182,36 @@ fn main() {
                     if sz > last_log_sz {
                         let mut buf = String::new();
                         if file.read_to_string(&mut buf).is_ok() {
-                            if let Some(ws) = parse_workspace(&buf) {
-                                if last_ws.as_ref() != Some(&ws) {
-                                    println!("Detected: {}", ws);
-                                    let p = std::path::Path::new(&ws);
+                            let (ws, fp) = parse_log(&buf);
+
+                            if let Some(ref workspace) = ws {
+                                if !workspaces.contains_key(workspace) {
+                                    println!("Detected workspace: {}", workspace);
+                                    let p = std::path::Path::new(workspace);
                                     let info = WorkspaceInfo {
                                         workspace_name: p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or("Untitled".into()),
-                                        workspace_path: ws.clone(),
+                                        workspace_path: workspace.clone(),
                                         language: detect_lang(p),
                                         git_branch: detect_branch(p),
-                                        file_name: None,
                                     };
                                     let _ = fs::write(&sf, serde_json::to_string_pretty(&info).unwrap_or_default());
-                                    send_activity(&mut client, &info, &t0);
-                                    last_ws = Some(ws);
+                                    workspaces.insert(workspace.clone(), info);
+                                }
+                                last_ws = Some(workspace.clone());
+                            }
+
+                            let current_ws = last_ws.clone().or_else(|| ws.clone());
+                            if let Some(ref ws_path) = current_ws {
+                                if let Some(info) = workspaces.get(ws_path) {
+                                    let file_info = fp.as_ref().map(|f| {
+                                        let path = std::path::Path::new(f);
+                                        let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| f.clone());
+                                        let ext = path.extension().map(|e| e.to_string_lossy().to_string()).unwrap_or_default();
+                                        let lang = lang_from_ext(&ext);
+                                        (name, lang.to_string())
+                                    });
+
+                                    send_activity(&mut client, info, &file_info, &t0);
                                 }
                             }
                         }
@@ -154,6 +227,7 @@ fn main() {
             let _ = client.clear_activity();
             last_ws = None;
             last_content.clear();
+            workspaces.clear();
             was_running = false;
             log_file = fs::File::open(&log_path).ok();
             last_log_sz = log_file.as_ref().and_then(|f| f.metadata().ok()).map(|m| m.len()).unwrap_or(0);
@@ -163,24 +237,19 @@ fn main() {
     }
 }
 
-fn send_activity(client: &mut DiscordIpcClient, info: &WorkspaceInfo, t0: &Instant) {
+fn send_activity(client: &mut DiscordIpcClient, info: &WorkspaceInfo, file_info: &Option<(String, String)>, t0: &Instant) {
     let branch = info.git_branch.as_deref().unwrap_or("");
     let lang = if info.language == "Unknown" { "" } else { &info.language };
-    let name = &info.workspace_name;
 
-    let details = if name.is_empty() || name == "No workspace" {
-        "Idle".into()
-    } else {
-        format!("Working on {}", name)
-    };
+    let details = format!("Working on {}", info.workspace_name);
 
-    let mut parts = Vec::new();
-    if !lang.is_empty() { parts.push(lang.to_string()); }
-    if !branch.is_empty() { parts.push(branch.to_string()); }
-    let state = if parts.is_empty() { "Zed".into() } else { parts.join(" - ") };
+    let mut state_parts = Vec::new();
+    if !lang.is_empty() { state_parts.push(lang.to_string()); }
+    if !branch.is_empty() { state_parts.push(branch.to_string()); }
+    let state = if state_parts.is_empty() { "Zed".into() } else { state_parts.join(" - ") };
 
-    let large = if name.is_empty() || name == "No workspace" { "Zed Editor".into() } else { name.clone() };
-    let small = if lang.is_empty() { "Zed".into() } else { lang.to_string() };
+    let large = info.workspace_name.clone();
+    let small = if !lang.is_empty() { lang.to_string() } else { "Zed".into() };
 
     let ts = now() - t0.elapsed().as_secs() as i64;
 
@@ -191,7 +260,7 @@ fn send_activity(client: &mut DiscordIpcClient, info: &WorkspaceInfo, t0: &Insta
         .timestamps(activity::Timestamps::new().start(ts));
 
     match client.set_activity(activity) {
-        Ok(_) => println!("Updated: {} - {}", name, lang),
+        Ok(_) => println!("Updated: {} - {}", info.workspace_name, lang),
         Err(e) => eprintln!("Activity: {}", e),
     }
 }
