@@ -32,7 +32,7 @@ fn zed_running() -> bool {
         for entry in entries.flatten() {
             if let Ok(name) = std::fs::read_to_string(entry.path().join("comm")) {
                 let n = name.trim();
-                if n == "zed" || n == "Zed" { return true; }
+                if n == "zed" || n == "Zed" || n == "zed-editor" { return true; }
             }
         }
     }
