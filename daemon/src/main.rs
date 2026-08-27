@@ -142,7 +142,7 @@ fn ensure_workspace_info(path: &str, workspaces: &mut HashMap<String, WorkspaceI
     info
 }
 
-fn send_activity(client: &mut DiscordIpcClient, info: &WorkspaceInfo, t0: &Instant) {
+fn send_activity(client: &mut DiscordIpcClient, info: &WorkspaceInfo, t0: &Instant) -> bool {
     let branch = info.git_branch.as_deref().unwrap_or("");
     let lang = if info.language == "Unknown" { "" } else { &info.language };
     let details = format!("Working on {}", info.workspace_name);
@@ -159,8 +159,16 @@ fn send_activity(client: &mut DiscordIpcClient, info: &WorkspaceInfo, t0: &Insta
         .assets(activity::Assets::new().large_text(&large).small_text(&small))
         .timestamps(activity::Timestamps::new().start(ts));
     match client.set_activity(activity) {
-        Ok(_) => println!("Updated: {} ({})", info.workspace_name, state),
-        Err(e) => eprintln!("Activity: {}", e),
+        Ok(_) => { println!("Updated: {} ({})", info.workspace_name, state); true }
+        Err(e) => { eprintln!("Activity: {}", e); false }
+    }
+}
+
+fn try_reconnect(client: &mut DiscordIpcClient) -> bool {
+    let _ = client.close();
+    match client.connect() {
+        Ok(_) => { println!("Reconnected to Discord"); true }
+        Err(e) => { eprintln!("Reconnect failed: {}", e); false }
     }
 }
 
@@ -186,6 +194,14 @@ fn process_log_chunk(chunk: &str, known: &mut HashMap<String, WorkspaceInfo>) ->
     (best_ws, store_count)
 }
 
+fn send_or_reconnect(client: &mut DiscordIpcClient, info: &WorkspaceInfo, t0: &Instant) {
+    if !send_activity(client, info, t0) {
+        if try_reconnect(client) {
+            send_activity(client, info, t0);
+        }
+    }
+}
+
 fn main() {
     println!("Zed Discord RPC starting...");
     let mut client = DiscordIpcClient::new(DISCORD_APP_ID);
@@ -197,11 +213,12 @@ fn main() {
     let log_path = zed_log();
     let mut known: HashMap<String, WorkspaceInfo> = HashMap::new();
     let mut active_ws: Option<String> = None;
-    let mut last_sent: Option<String> = None;
     let mut last_content = String::new();
     let t0 = Instant::now();
     let mut was_running = false;
     let mut prev_stores: Option<usize> = None;
+    let mut discord_ok = true;
+    let mut reconnect_tick = 0u32;
 
     if let Ok(content) = fs::read_to_string(&all_workspaces_file()) {
         if let Ok(loaded) = serde_json::from_str::<HashMap<String, WorkspaceInfo>>(&content) {
@@ -212,42 +229,57 @@ fn main() {
     loop {
         let running = zed_running();
 
+        if !discord_ok {
+            reconnect_tick += 1;
+            if reconnect_tick >= 15 {
+                reconnect_tick = 0;
+                if try_reconnect(&mut client) {
+                    discord_ok = true;
+                    if let Some(ref ws) = active_ws {
+                        if let Some(info) = known.get(ws) {
+                            send_activity(&mut client, info, &t0);
+                            println!("Resent after reconnect: {}", info.workspace_name);
+                        }
+                    }
+                }
+            }
+            thread::sleep(Duration::from_millis(1000));
+            continue;
+        }
+
         if running {
             if !was_running {
                 println!("Zed started");
-                last_sent = None;
                 active_ws = None;
                 prev_stores = None;
+                last_content.clear();
 
-    if let Ok(content) = fs::read_to_string(&log_path) {
-        let (ws, sc) = process_log_chunk(&content, &mut known);
-        active_ws = ws;
-        prev_stores = sc;
-    }
+                if let Ok(content) = fs::read_to_string(&log_path) {
+                    let (ws, sc) = process_log_chunk(&content, &mut known);
+                    active_ws = ws;
+                    prev_stores = sc;
+                    last_content = content;
+                }
 
-    if let Some(ref ws) = active_ws {
-        if let Some(info) = known.get(ws) {
-            send_activity(&mut client, info, &t0);
-            last_sent = Some(ws.clone());
-            println!("Initial: {}", info.workspace_name);
-        }
-    }
+                if let Some(ref ws) = active_ws {
+                    if let Some(info) = known.get(ws) {
+                        send_or_reconnect(&mut client, info, &t0);
+                        discord_ok = true;
+                        println!("Initial: {}", info.workspace_name);
+                    }
+                }
             }
 
             let mut log_changed = false;
             let mut new_chunk = String::new();
 
             if let Ok(content) = fs::read_to_string(&log_path) {
-                if content.len() != last_content.len() || content != last_content {
-                    if content.len() > last_content.len() {
-                        let start = last_content.len();
-                        if start <= content.len() {
-                            new_chunk = content[start..].to_string();
-                            log_changed = !new_chunk.is_empty();
-                        }
-                    }
-                    last_content = content;
+                if content.len() > last_content.len() {
+                    let start = last_content.len();
+                    new_chunk = content[start..].to_string();
+                    log_changed = !new_chunk.is_empty();
                 }
+                last_content = content;
             }
 
             if log_changed && !new_chunk.is_empty() {
@@ -258,8 +290,8 @@ fn main() {
                     if active_ws.as_ref() != Some(&ws) {
                         active_ws = Some(ws.clone());
                         if let Some(info) = known.get(&ws) {
-                            send_activity(&mut client, info, &t0);
-                            last_sent = Some(ws);
+                            send_or_reconnect(&mut client, info, &t0);
+                            discord_ok = true;
                             println!("Switched to: {}", info.workspace_name);
                         }
                     }
@@ -278,9 +310,11 @@ fn main() {
             was_running = true;
         } else if was_running {
             println!("Zed closed");
-            let _ = client.clear_activity();
+            if let Err(e) = client.clear_activity() {
+                eprintln!("Clear failed: {}", e);
+                discord_ok = false;
+            }
             active_ws = None;
-            last_sent = None;
             last_content.clear();
             prev_stores = None;
             was_running = false;
