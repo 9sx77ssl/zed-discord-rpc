@@ -54,9 +54,31 @@ fn detect_lang(p: &std::path::Path) -> String {
 }
 
 fn detect_branch(p: &std::path::Path) -> Option<String> {
-    let head = fs::read_to_string(p.join(".git/HEAD")).ok()?;
-    let h = head.trim();
-    Some(h.strip_prefix("ref: refs/heads/").unwrap_or(h.get(..7).unwrap_or(h)).into())
+    // Try direct .git/HEAD
+    let head_path = p.join(".git/HEAD");
+    if let Ok(head) = fs::read_to_string(&head_path) {
+        let h = head.trim();
+        return Some(h.strip_prefix("ref: refs/heads/").unwrap_or(h.get(..7).unwrap_or(h)).into());
+    }
+
+    // Try git worktree (.git file pointing to main git dir)
+    let git_file = p.join(".git");
+    if git_file.exists() && git_file.is_file() {
+        if let Ok(content) = fs::read_to_string(&git_file) {
+            for line in content.lines() {
+                if let Some(gitdir) = line.strip_prefix("gitdir: ") {
+                    let gitdir = gitdir.trim();
+                    let head_path = std::path::Path::new(gitdir).join("HEAD");
+                    if let Ok(head) = fs::read_to_string(&head_path) {
+                        let h = head.trim();
+                        return Some(h.strip_prefix("ref: refs/heads/").unwrap_or(h.get(..7).unwrap_or(h)).into());
+                    }
+                }
+            }
+        }
+    }
+
+    None
 }
 
 fn lang_from_ext(ext: &str) -> &str {
@@ -107,7 +129,9 @@ fn parse_log(log: &str) -> (Option<String>, Option<String>) {
                     let mut p = line[st..st+e].to_string();
                     if !p.starts_with('/') { p.insert(0, '/'); }
                     if !p.is_empty() && p != "/" && !skip.iter().any(|x| p.starts_with(x)) {
-                        workspace = Some(p);
+                        if std::path::Path::new(&p).exists() {
+                            workspace = Some(p);
+                        }
                     }
                 }
             }
