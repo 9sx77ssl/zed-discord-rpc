@@ -109,7 +109,6 @@ fn main() {
                 if let Some(ref mut f) = log_file { let _ = f.seek(std::io::SeekFrom::Start(0)); }
             }
 
-            // Try state file from extension
             if let Ok(content) = fs::read_to_string(&sf) {
                 if content != last_content {
                     if let Ok(info) = serde_json::from_str::<WorkspaceInfo>(&content) {
@@ -120,7 +119,6 @@ fn main() {
                 }
             }
 
-            // Try log file
             if let Some(ref mut file) = log_file {
                 if let Ok(meta) = fs::metadata(&log_path) {
                     let sz = meta.len();
@@ -161,48 +159,39 @@ fn main() {
             last_log_sz = log_file.as_ref().and_then(|f| f.metadata().ok()).map(|m| m.len()).unwrap_or(0);
         }
 
-        thread::sleep(Duration::from_millis(800));
+        thread::sleep(Duration::from_millis(400));
     }
 }
 
 fn send_activity(client: &mut DiscordIpcClient, info: &WorkspaceInfo, t0: &Instant) {
-    let branch = info.git_branch.as_deref().unwrap_or("main");
+    let branch = info.git_branch.as_deref().unwrap_or("");
     let lang = if info.language == "Unknown" { "" } else { &info.language };
+    let name = &info.workspace_name;
 
-    let state = if lang.is_empty() {
-        branch.to_string()
-    } else if branch == "main" || branch.is_empty() {
-        lang.to_string()
-    } else {
-        format!("{} | {}", lang, branch)
-    };
-
-    let state = if state.is_empty() { "Zed".into() } else { state };
-
-    let details = if info.workspace_name.is_empty() || info.workspace_name == "No workspace" {
+    let details = if name.is_empty() || name == "No workspace" {
         "Idle".into()
     } else {
-        format!("Working on {}", info.workspace_name)
+        format!("Working on {}", name)
     };
 
-    let large_text = if info.workspace_name.is_empty() || info.workspace_name == "No workspace" {
-        "Zed Editor".into()
-    } else {
-        info.workspace_name.clone()
-    };
+    let mut parts = Vec::new();
+    if !lang.is_empty() { parts.push(lang.to_string()); }
+    if !branch.is_empty() { parts.push(branch.to_string()); }
+    let state = if parts.is_empty() { "Zed".into() } else { parts.join(" - ") };
 
-    let small_text = if info.language == "Unknown" { "Zed".into() } else { info.language.clone() };
+    let large = if name.is_empty() || name == "No workspace" { "Zed Editor".into() } else { name.clone() };
+    let small = if lang.is_empty() { "Zed".into() } else { lang.to_string() };
 
     let ts = now() - t0.elapsed().as_secs() as i64;
 
     let activity = activity::Activity::new()
         .state(&state)
         .details(&details)
-        .assets(activity::Assets::new().large_text(&large_text).small_text(&small_text))
+        .assets(activity::Assets::new().large_text(&large).small_text(&small))
         .timestamps(activity::Timestamps::new().start(ts));
 
     match client.set_activity(activity) {
-        Ok(_) => println!("Updated: {} - {}", info.workspace_name, info.language),
+        Ok(_) => println!("Updated: {} - {}", name, lang),
         Err(e) => eprintln!("Activity: {}", e),
     }
 }
